@@ -1,0 +1,129 @@
+def server = Artifactory.server "Artifactory"
+def downloadSpec = """{
+    "files": [
+        {
+            "pattern": "DevKit/EVault/AgentAutomation/AutomationFramework/*.zip",
+            "target": "LatestTestFrameworkBinaries/",
+            "flat": true,
+            "build": "AgentTest-Framework-Continuous/LATEST",
+            "explode": true
+        },
+        {
+            "pattern": "DevKit/EVault/Director-Windows-DevKit/Director*.zip",
+            "target": "DirectorMainKits/",
+            "flat": true,
+            "build": "Director-Main-Full/LATEST",
+            "explode": true
+        }
+    ]
+}"""
+def props=''
+def artifact_name=''
+pipeline {
+    agent { label 'Win2008R2-BSVR23' }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '5', artifactNumToKeepStr: '5'))
+        disableConcurrentBuilds()
+        timestamps()
+        ansiColor('xterm')
+    }
+    stages {
+        stage('Perforce P4 checkout AutoTest'){
+            steps {
+                deleteDir()
+                checkout perforce(credential: '8966be87-6fd8-41e0-a12f-7fc7dbdedca8', populate: forceClean(have: false, parallel: [enable: false, minbytes: '1024', minfiles: '1', threads: '4'], pin: '', quiet: true), workspace: manualSpec(charset: 'none', name: '${JOB_NAME}', pinHost: false, spec: clientSpec(allwrite: false, backup: false, clobber: false, compress: false, line: 'LOCAL', locked: false, modtime: false, rmdir: false, serverID: '', streamName: '', type: 'WRITABLE', view: """//depot/agent/main/AutoTest/Agent/bin/... //${JOB_NAME}/agent/main/AutoTest/Agent/bin/...
+//depot/agent/main/AutoTest/Agent/local_utils/...  //${JOB_NAME}/agent/main/AutoTest/Agent/local_utils/...""")))
+            }
+        }
+        stage('Download AutoFRM'){
+            steps {
+                script {
+
+                    server.download(downloadSpec)
+                }
+            }
+        }
+        stage('Sync Agent Driver'){
+            steps {
+                dir ("agent/main/AutoTest/Agent/bin") {
+                    bat 'syncDriver.bat agent-td24'    
+                }
+            }
+        }
+        stage('Kill AutoTest Driver'){
+            steps {
+                withCredentials([string(credentialsId: 'DEVPASSWD', variable: 'DEVPASSWD')]) {
+                    dir ("agent/main/AutoTest/Agent/local_utils") {
+                        bat 'psexec \\\\agent-td24 -i -u Administrator -p %DEVPASSWD% -acceptEula c:\\depot\\agent\\main\\AutoTest\\Agent\\bin\\deletelogs.bat'
+                    }
+                }
+            }
+        }
+        stage('Delete AutoTest Logs'){
+            steps {
+                withCredentials([string(credentialsId: 'DEVPASSWD', variable: 'DEVPASSWD')]) {
+                    dir ("agent/main/AutoTest/Agent/local_utils") {
+                        bat 'psexec \\\\agent-td24 -i -u Administrator -p %DEVPASSWD% -acceptEula c:\\depot\\agent\\main\\AutoTest\\Agent\\bin\\deletelogs.bat'
+                    }
+                }
+            }
+        }
+        stage('Agent Framwork and Vault Install Kit Prep') {
+            steps {
+                withCredentials([string(credentialsId: 'DEVPASSWD', variable: 'DEVPASSWD')]) {
+                    bat '''set Destination=\\\\agent-td24\\c$\\depot\\agent\\main\\AutoTest\\AutotestKits\\Windows
+                    net use %Destination% %DEVPASSWD% /USER:Administrator
+                    del /q "%Destination%\\LatestQAUtilities\\*"
+                    del /q "%Destination%\\VaultInstallKit\\setup.exe"
+                    xcopy /r /y /f "LatestTestFrameworkBinaries" "%Destination%\\LatestQAUtilities"
+                    xcopy /r /y /f "DirectorMainKits\\Director*.exe" "%Destination%\\VaultInstallKit"
+                    ren "%Destination%\\VaultInstallKit\\Director*.exe" "setup.exe"
+                    net use "%Destination%" /d /y'''
+                }
+            }
+        }
+        stage('Run Tests AsyncRunner'){
+            steps {
+                withCredentials([string(credentialsId: 'DEVPASSWD', variable: 'DEVPASSWD')]) {
+                    dir ("agent/main/AutoTest/Agent/local_utils"){
+                        bat 'psexec \\\\agent-td24 -u Administrator -p %DEVPASSWD% -w c:\\depot\\agent\\main\\AutoTest\\Agent\\bin -i -acceptEula c:\\depot\\agent\\main\\AutoTest\\Agent\\bin\\triggerTestsAsync.bat Config\\CIPipeline\\DirectorCIP DirCIP.config'
+                    }
+                }
+            }
+        }
+       stage('Archive Logs'){
+            steps {
+                withCredentials([string(credentialsId: 'DEVPASSWD', variable: 'DEVPASSWD')]) {
+                    dir ("agent/main/AutoTest/Agent/local_utils"){
+                        bat '''psexec \\\\agent-td24 -u Administrator -p %DEVPASSWD% -w c:\\depot\\agent\\main\\AutoTest\\Agent\\bin -i -acceptEula c:\\depot\\agent\\main\\AutoTest\\Agent\\bin\\archivelogs.bat
+                        set NETSHARE="\\\\agent-td24\\C$"
+                        net use %NETSHARE% /user:Administrator %DEVPASSWD%
+                        copy %NETSHARE%\\Logs.zip %WORKSPACE%\\%JOB_NAME%_LOGS.zip /Y
+                        net use %NETSHARE% /d /y
+                        
+						psexec \\\\agent-td24 -i -u Administrator -p %DEVPASSWD% -acceptEula c:\\depot\\agent\\main\\AutoTest\\Agent\\bin\\copyAllLogsEd.bat'''
+                    }
+                }
+            }
+        }
+/*        stage('Artifactory Promotion'){
+            steps {
+                dir ("DirectorMainKits") {
+                    powershell '''$artifactName=Get-ChildItem -force | Where-Object {$_.name -like "Director-*.exe"} | % {$_.BaseName}
+Add-Content $ENV:WORKSPACE/envVars.properties "ARTIFACT_NAME=$artifactName"'''
+                }
+                script {
+                    props=readProperties file: 'envVars.properties'
+                    artifact_name=props['ARTIFACT_NAME']
+                }
+                build job: 'Artifact-Stage-Pipeline', parameters: [string(name: 'Artifact_Name', value: "$artifact_name"), string(name: 'Source_Repo', value: "DevKit"), string(name: 'Target_Repo', value: "QA1")]
+            }
+        }
+*/
+    }
+    post {
+        always {
+            emailext attachmentsPattern: '**/%JOB_BASE_NAME%_LOGS.zip', body: '$DEFAULT_CONTENT', replyTo: '$DEFAULT_REPLYTO', subject: '$DEFAULT_SUBJECT', to: 'jzhang@carbonite.com'
+        }       
+    }
+}
